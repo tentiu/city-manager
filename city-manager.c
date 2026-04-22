@@ -1,6 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <time.h>
+#include <errno.h>
 
 #define NAME_LEN   64
 #define CAT_LEN    32
@@ -34,26 +39,26 @@ static void log_action(const char *district, const char *role,
                         const char *user, const char *action) {
     char lp[256];
     log_path(district, lp, sizeof(lp));
-    int fd = open(lp, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd < 0) return;
+    //int fd = popen(lp, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    //if (fd < 0) return;
     chmod(lp, 0644);
 
     time_t now = time(NULL);
     char line[512];
     snprintf(line, sizeof(line), "%ld\t%s\t%s\t%s\n",
              (long)now, user, role, action);
-    write(fd, line, strlen(line));
-    close(fd);
+    //fwrite(fd, line, strlen(line));
+   // pclose(fd);
 }
 
 static int check_perm(const char *path, int role, int need_read, int need_write) {
     struct stat st;
     if (stat(path, &st) < 0) return 0;
     mode_t m = st.st_mode;
-    if (role == 0) { /* manager = owner bits */
+    if (role == 0) {
         if (need_read  && !(m & S_IRUSR)) return 0;
         if (need_write && !(m & S_IWUSR)) return 0;
-    } else { /* inspector = group bits */
+    } else {
         if (need_read  && !(m & S_IRGRP)) return 0;
         if (need_write && !(m & S_IWGRP)) return 0;
     }
@@ -88,12 +93,12 @@ int parse_condition(const char *input, char *field, char *op, char *value) {
 }
 
 int main(int argc, char *argv[]) {
-    char *role     = NULL;
+   char *role     = NULL;
     char *user     = NULL;
     char *command  = NULL;
     char *district = NULL;
     int   report_id = -1;
-    int   threshold = -1;
+   int   threshold = -1;
     char *filter_conds[8];
     int   filter_count = 0;
 
@@ -121,12 +126,11 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--filter") == 0 && i+1 < argc) {
             command  = "filter";
             district = argv[++i];
-            /* collect remaining args as conditions */
             while (i+1 < argc && argv[i+1][0] != '-' && filter_count < 8) {
                 filter_conds[filter_count++] = argv[++i];
             }
         }
     }
 
-retrun 0;
+return 0;
 }
