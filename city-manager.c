@@ -102,7 +102,6 @@ static void ensure_district(const char *district) {
     cfg_path(district, cp, sizeof(cp));
     log_path(district, lp, sizeof(lp));
 
-    /* reports.dat */
     if (stat(rp, &st) < 0) {
         int fd = open(rp, O_CREAT | O_WRONLY, 0664);
         if (fd >= 0) close(fd);
@@ -153,6 +152,7 @@ static int next_id(const char *district) {
     return max_id + 1;
 }
 
+
 static void op_add(const char *district, const char *role,
                    const char *user, int is_manager) {
     ensure_district(district);
@@ -180,7 +180,7 @@ static void op_add(const char *district, const char *role,
     printf("Severity level (1/2/3): "); fflush(stdout); scanf("%d", &r.severity);
     printf("Description: "); fflush(stdout); getchar();
     fgets(r.description, DESC_LEN, stdin);
-   
+    
     size_t dl = strlen(r.description);
     if (dl > 0 && r.description[dl-1] == '\n') r.description[dl-1] = '\0';
 
@@ -359,6 +359,7 @@ int parse_condition(const char *input, char *field, char *op, char *value) {
     const char *first = strchr(input, ':');
     if (!first) return 0;
 
+    /* field */
     size_t flen = (size_t)(first - input);
     if (flen == 0 || flen >= 32) return 0;
     strncpy(field, input, flen);
@@ -394,7 +395,6 @@ int parse_condition(const char *input, char *field, char *op, char *value) {
 int match_condition(Report *r, const char *field, const char *op, const char *value) {
     if (!r || !field || !op || !value) return 0;
 
-    /* severity – integer comparison */
     if (strcmp(field, "severity") == 0) {
         int v = atoi(value);
         if (strcmp(op, "==") == 0) return r->severity == v;
