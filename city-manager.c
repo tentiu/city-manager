@@ -1,5 +1,8 @@
+
 #define _POSIX_C_SOURCE 200809L
+
 #define _XOPEN_SOURCE   700
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,9 +10,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>   /* waitpid() - asteptam procesul copil dupa fork() */
 #include <time.h>
 #include <errno.h>
 #include <dirent.h>
+#include <signal.h>     /* kill(), SIGUSR1 - pentru notificarea monitorului */
 
 #define NAME_LEN   64
 #define CAT_LEN    32
@@ -27,7 +32,7 @@ typedef struct {
 } Report;
 
 
-/* Convert permission bits to rwxrwxrwx string (9 chars + NUL). */
+/* Converteste bitii de permisiune in sir rwxrwxrwx */
 static void mode_to_str(mode_t m, char *out) {
     out[0] = (m & S_IRUSR) ? 'r' : '-';
     out[1] = (m & S_IWUSR) ? 'w' : '-';
@@ -41,7 +46,7 @@ static void mode_to_str(mode_t m, char *out) {
     out[9] = '\0';
 }
 
-/* Build path strings */
+/* Construieste caile catre fisierele unui district */
 static void reports_path(const char *district, char *out, size_t sz) {
     snprintf(out, sz, "%s/reports.dat", district);
 }
@@ -55,7 +60,7 @@ static void symlink_name(const char *district, char *out, size_t sz) {
     snprintf(out, sz, "active_reports-%s", district);
 }
 
-/* Append a line to the operation log */
+/* Adauga o linie in fisierul de log al districtului */
 static void log_action(const char *district, const char *role,
                         const char *user, const char *action) {
     char lp[256];
@@ -63,40 +68,36 @@ static void log_action(const char *district, const char *role,
     int fd = open(lp, O_WRONLY | O_APPEND | O_CREAT, 0644);
     if (fd < 0) return;
     chmod(lp, 0644);
-
     time_t now = time(NULL);
     char line[512];
-    snprintf(line, sizeof(line), "%ld\t%s\t%s\t%s\n",
-             (long)now, user, role, action);
+    snprintf(line, sizeof(line), "%ld\t%s\t%s\t%s\n", (long)now, user, role, action);
     write(fd, line, strlen(line));
     close(fd);
 }
 
-/* Check whether a permission bit matches what the role needs.
-   role 0 = manager (owner), role 1 = inspector (group).
-   Returns 1 if allowed, 0 if denied. */
+/* Verifica permisiunile pentru un rol pe un fisier.
+   role=0 manager (owner bits), role=1 inspector (group bits) */
 static int check_perm(const char *path, int role, int need_read, int need_write) {
     struct stat st;
     if (stat(path, &st) < 0) return 0;
     mode_t m = st.st_mode;
-    if (role == 0) { /* manager = owner bits */
+    if (role == 0) {
         if (need_read  && !(m & S_IRUSR)) return 0;
         if (need_write && !(m & S_IWUSR)) return 0;
-    } else { /* inspector = group bits */
+    } else {
         if (need_read  && !(m & S_IRGRP)) return 0;
         if (need_write && !(m & S_IWGRP)) return 0;
     }
     return 1;
 }
 
-/* Create district directory + files if they don't exist */
+/* Creeaza structura de fisiere a unui district daca nu exista */
 static void ensure_district(const char *district) {
     struct stat st;
     if (stat(district, &st) < 0) {
         mkdir(district, 0750);
         chmod(district, 0750);
     }
-
     char rp[256], cp[256], lp[256];
     reports_path(district, rp, sizeof(rp));
     cfg_path(district, cp, sizeof(cp));
@@ -107,8 +108,6 @@ static void ensure_district(const char *district) {
         if (fd >= 0) close(fd);
         chmod(rp, 0664);
     }
-
-    /* district.cfg – write default threshold if new */
     if (stat(cp, &st) < 0) {
         int fd = open(cp, O_CREAT | O_WRONLY, 0640);
         if (fd >= 0) {
@@ -118,26 +117,22 @@ static void ensure_district(const char *district) {
         }
         chmod(cp, 0640);
     }
-
-    /* logged_district */
     if (stat(lp, &st) < 0) {
         int fd = open(lp, O_CREAT | O_WRONLY, 0644);
         if (fd >= 0) close(fd);
         chmod(lp, 0644);
     }
 
-    /* Symbolic link active_reports-<district> -> reports.dat */
     char sl[256], target[512];
     symlink_name(district, sl, sizeof(sl));
     snprintf(target, sizeof(target), "%s/reports.dat", district);
-
     struct stat lst;
     if (lstat(sl, &lst) < 0) {
         symlink(target, sl);
     }
 }
 
-/* Next report ID = max existing + 1 */
+/* Returneaza urmatorul ID disponibil */
 static int next_id(const char *district) {
     char rp[256];
     reports_path(district, rp, sizeof(rp));
@@ -152,6 +147,83 @@ static int next_id(const char *district) {
     return max_id + 1;
 }
 
+/* Citeste PID-ul monitorului din fisierul .monitor_pid.
+   Returneaza PID-ul daca fisierul exista si contine un numar valid, -1 altfel. */
+static pid_t read_monitor_pid(void) {
+    /* Deschidem fisierul ascuns .monitor_pid */
+    int fd = open(".monitor_pid", O_RDONLY);
+    if (fd < 0) return -1; /* fisierul nu exista => monitorul nu ruleaza */
+
+    /* Citim continutul in buffer */
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) return -1; /* fisier gol sau eroare */
+
+    /* Convertim sirul citit la un PID (intreg) */
+    pid_t pid = (pid_t)atoi(buf);
+    if (pid <= 0) return -1; /* valoare invalida */
+    return pid;
+}
+
+/* Trimite SIGUSR1 catre procesul monitor pentru a-l notifica de un raport nou.
+   Inregistreaza in log daca notificarea a reusit sau nu.
+   district si user sunt folosite pentru mesajul de log. */
+static void notify_monitor(const char *district, const char *role,
+                            const char *user, int report_id) {
+    /* Citim PID-ul monitorului */
+    pid_t monitor_pid = read_monitor_pid();
+
+    /* Construim calea catre log pentru a scrie rezultatul notificarii */
+    char lp[256];
+    log_path(district, lp, sizeof(lp));
+    int fd = open(lp, O_WRONLY | O_APPEND | O_CREAT, 0644);
+
+    if (monitor_pid < 0) {
+        /* Nu am gasit PID-ul => monitorul nu ruleaza sau fisierul lipseste */
+        printf("Monitor not running (no .monitor_pid found). Notification skipped.\n");
+        if (fd >= 0) {
+            time_t now = time(NULL);
+            char line[512];
+            snprintf(line, sizeof(line),
+                     "%ld\t%s\t%s\tmonitor_notify_failed: no PID for report %d\n",
+                     (long)now, user, role, report_id);
+            write(fd, line, strlen(line));
+            close(fd);
+        }
+        return;
+    }
+
+    /* kill() cu SIGUSR1 trimite semnalul catre procesul cu PID-ul dat.
+       Nu omoara procesul! SIGUSR1 e un semnal user-defined folosit pentru notificari. */
+    if (kill(monitor_pid, SIGUSR1) == 0) {
+        /* Semnalul a fost trimis cu succes */
+        printf("Monitor notified (PID %d) about report %d.\n", monitor_pid, report_id);
+        if (fd >= 0) {
+            time_t now = time(NULL);
+            char line[512];
+            snprintf(line, sizeof(line),
+                     "%ld\t%s\t%s\tmonitor_notified: PID=%d report=%d\n",
+                     (long)now, user, role, monitor_pid, report_id);
+            write(fd, line, strlen(line));
+        }
+    } else {
+        /* kill() a esuat => PID-ul din fisier nu mai e valid (monitorul s-a oprit) */
+        printf("Monitor notify failed (PID %d no longer running).\n", monitor_pid);
+        if (fd >= 0) {
+            time_t now = time(NULL);
+            char line[512];
+            snprintf(line, sizeof(line),
+                     "%ld\t%s\t%s\tmonitor_notify_failed: PID=%d dead for report %d\n",
+                     (long)now, user, role, monitor_pid, report_id);
+            write(fd, line, strlen(line));
+        }
+    }
+    if (fd >= 0) close(fd);
+}
+
 
 static void op_add(const char *district, const char *role,
                    const char *user, int is_manager) {
@@ -160,7 +232,6 @@ static void op_add(const char *district, const char *role,
     char rp[256];
     reports_path(district, rp, sizeof(rp));
 
-    /* Both roles may add; check write access on reports.dat for the role */
     if (!check_perm(rp, is_manager ? 0 : 1, 0, 1)) {
         fprintf(stderr, "Permission denied: %s cannot write to %s\n", role, rp);
         return;
@@ -168,7 +239,6 @@ static void op_add(const char *district, const char *role,
 
     Report r;
     memset(&r, 0, sizeof(r));
-
     r.id = next_id(district);
     strncpy(r.inspector, user, NAME_LEN - 1);
     r.timestamp = time(NULL);
@@ -180,7 +250,6 @@ static void op_add(const char *district, const char *role,
     printf("Severity level (1/2/3): "); fflush(stdout); scanf("%d", &r.severity);
     printf("Description: "); fflush(stdout); getchar();
     fgets(r.description, DESC_LEN, stdin);
-    
     size_t dl = strlen(r.description);
     if (dl > 0 && r.description[dl-1] == '\n') r.description[dl-1] = '\0';
 
@@ -192,10 +261,11 @@ static void op_add(const char *district, const char *role,
 
     log_action(district, role, user, "add");
     printf("Report %d added to district '%s'.\n", r.id, district);
+
+    notify_monitor(district, role, user, r.id);
 }
 
-static void op_list(const char *district, const char *role,
-                    const char *user) {
+static void op_list(const char *district, const char *role, const char *user) {
     char rp[256];
     reports_path(district, rp, sizeof(rp));
 
@@ -221,8 +291,7 @@ static void op_list(const char *district, const char *role,
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
         printf("ID: %d | Inspector: %s | Lat: %.4f | Lon: %.4f | "
                "Category: %s | Severity: %d | Time: %s\n",
-               r.id, r.inspector, r.lat, r.lon,
-               r.category, r.severity, ts);
+               r.id, r.inspector, r.lat, r.lon, r.category, r.severity, ts);
         count++;
     }
     close(fd);
@@ -258,7 +327,6 @@ static void op_view(const char *district, int report_id,
     }
     close(fd);
     if (!found) fprintf(stderr, "Report %d not found in district '%s'.\n", report_id, district);
-
     log_action(district, role, user, "view");
 }
 
@@ -271,7 +339,6 @@ static void op_remove_report(const char *district, int report_id,
 
     char rp[256];
     reports_path(district, rp, sizeof(rp));
-
     int fd = open(rp, O_RDWR);
     if (fd < 0) { perror("open reports.dat"); return; }
 
@@ -279,7 +346,6 @@ static void op_remove_report(const char *district, int report_id,
     fstat(fd, &st);
     int n = (int)(st.st_size / sizeof(Report));
 
-    /* Find index of report */
     int idx = -1;
     Report r;
     for (int i = 0; i < n; i++) {
@@ -294,7 +360,6 @@ static void op_remove_report(const char *district, int report_id,
         return;
     }
 
-    /* Shift records after idx one position to the left */
     for (int i = idx + 1; i < n; i++) {
         lseek(fd, (off_t)(i * sizeof(Report)), SEEK_SET);
         read(fd, &r, sizeof(r));
@@ -302,15 +367,12 @@ static void op_remove_report(const char *district, int report_id,
         write(fd, &r, sizeof(r));
     }
 
-    /* Truncate file by one record */
     ftruncate(fd, (off_t)((n - 1) * sizeof(Report)));
     close(fd);
 
-    /* Verify with stat */
     stat(rp, &st);
     printf("Report %d removed. File now %lld bytes (%d records).\n",
            report_id, (long long)st.st_size, n - 1);
-
     log_action(district, role, user, "remove_report");
 }
 
@@ -324,10 +386,10 @@ static void op_update_threshold(const char *district, int value,
     char cp[256];
     cfg_path(district, cp, sizeof(cp));
 
-    /* Verify permission bits are exactly 640 */
     struct stat st;
     if (stat(cp, &st) < 0) { perror("stat district.cfg"); return; }
-    mode_t expected = S_IRUSR | S_IWUSR | S_IRGRP; /* 640 */
+
+    mode_t expected = S_IRUSR | S_IWUSR | S_IRGRP; 
     if ((st.st_mode & 0777) != expected) {
         fprintf(stderr, "Security check failed: district.cfg permissions changed "
                 "(expected 640, got %03o). Refusing to write.\n",
@@ -346,30 +408,81 @@ static void op_update_threshold(const char *district, int value,
     log_action(district, role, user, "update_threshold");
 }
 
-/* ─── AI-assisted filter functions ──────────────────────────────────────── */
+/* Sterge un district complet: directorul sau si symlink-ul corespunzator.*/
+static void op_remove_district(const char *district, const char *role,
+                                const char *user, int is_manager) {
+    /* Verificam rolul - doar managerul poate sterge un district */
+    if (!is_manager) {
+        fprintf(stderr, "Permission denied: only managers can remove districts.\n");
+        return;
+    }
 
-/*
- * parse_condition: split "field:operator:value" into its three parts.
- * Generated with AI assistance (see ai_usage.md), reviewed and adapted.
- * Returns 1 on success, 0 on failure.
- */
+    /* Verificam ca districtul exista inainte sa incercam sa il stergem */
+    struct stat st;
+    if (stat(district, &st) < 0) {
+        fprintf(stderr, "District '%s' does not exist.\n", district);
+        return;
+    }
+
+    printf("Removing district '%s'...\n", district);
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        /* fork() a esuat - nu s-a putut crea procesul copil */
+        perror("fork failed");
+        return;
+    }
+
+    if (pid == 0) {
+        char *args[] = { "rm", "-rf", (char *)district, NULL };
+        execvp("rm", args);
+        /* Daca execvp() returneaza, inseamna ca a esuat */
+        perror("execvp rm failed");
+        exit(1); /* iesim din procesul copil cu cod de eroare */
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        printf("District directory '%s' removed successfully.\n", district);
+    } else {
+        fprintf(stderr, "Failed to remove district directory '%s'.\n", district);
+        return;
+    }
+
+    char sl[256];
+    symlink_name(district, sl, sizeof(sl));
+
+    /* Verificam cu lstat() daca symlink-ul exista (lstat nu urmareste symlink-ul) */
+    struct stat lst;
+    if (lstat(sl, &lst) == 0) {
+        if (unlink(sl) == 0) {
+            printf("Symlink '%s' removed.\n", sl);
+        } else {
+            perror("unlink symlink failed");
+        }
+    } else {
+        printf("Symlink '%s' did not exist (skipped).\n", sl);
+    }
+
+    /* Nu mai putem loga in districtul sters, logam doar in stdout */
+    printf("District '%s' fully removed by %s (%s).\n", district, user, role);
+}
+
+
 int parse_condition(const char *input, char *field, char *op, char *value) {
     if (!input || !field || !op || !value) return 0;
-
     const char *first = strchr(input, ':');
     if (!first) return 0;
-
-    /* field */
     size_t flen = (size_t)(first - input);
     if (flen == 0 || flen >= 32) return 0;
     strncpy(field, input, flen);
     field[flen] = '\0';
-
     const char *second = NULL;
-    /* operator can be ==, !=, <=, >=, <, > */
     const char *p = first + 1;
-    if ((p[0] == '<' || p[0] == '>' || p[0] == '!' || p[0] == '=') &&
-         p[1] == '=') {
+    if ((p[0] == '<' || p[0] == '>' || p[0] == '!' || p[0] == '=') && p[1] == '=') {
         op[0] = p[0]; op[1] = p[1]; op[2] = '\0';
         second = p + 2;
     } else if (p[0] == '<' || p[0] == '>') {
@@ -378,23 +491,15 @@ int parse_condition(const char *input, char *field, char *op, char *value) {
     } else {
         return 0;
     }
-
     if (second[0] != ':') return 0;
     second++;
-
     strncpy(value, second, 63);
     value[63] = '\0';
     return 1;
 }
 
-/*
- * match_condition: return 1 if record r satisfies field:op:value.
- * Generated with AI assistance (see ai_usage.md), reviewed and adapted.
- * The AI left type conversion partly incomplete; integer conversion added manually.
- */
 int match_condition(Report *r, const char *field, const char *op, const char *value) {
     if (!r || !field || !op || !value) return 0;
-
     if (strcmp(field, "severity") == 0) {
         int v = atoi(value);
         if (strcmp(op, "==") == 0) return r->severity == v;
@@ -404,8 +509,6 @@ int match_condition(Report *r, const char *field, const char *op, const char *va
         if (strcmp(op, ">")  == 0) return r->severity >  v;
         if (strcmp(op, ">=") == 0) return r->severity >= v;
     }
-
-    /* timestamp – integer comparison */
     if (strcmp(field, "timestamp") == 0) {
         long long v = atoll(value);
         long long ts = (long long)r->timestamp;
@@ -416,23 +519,18 @@ int match_condition(Report *r, const char *field, const char *op, const char *va
         if (strcmp(op, ">")  == 0) return ts >  v;
         if (strcmp(op, ">=") == 0) return ts >= v;
     }
-
-    /* category – string comparison (only == and != make sense) */
     if (strcmp(field, "category") == 0) {
         int cmp = strcmp(r->category, value);
         if (strcmp(op, "==") == 0) return cmp == 0;
         if (strcmp(op, "!=") == 0) return cmp != 0;
         return 0;
     }
-
-    /* inspector – string comparison */
     if (strcmp(field, "inspector") == 0) {
         int cmp = strcmp(r->inspector, value);
         if (strcmp(op, "==") == 0) return cmp == 0;
         if (strcmp(op, "!=") == 0) return cmp != 0;
         return 0;
     }
-
     return 0;
 }
 
@@ -440,8 +538,6 @@ static void op_filter(const char *district, int cond_count,
                        char **conditions, const char *role, const char *user) {
     char rp[256];
     reports_path(district, rp, sizeof(rp));
-
-    /* Parse all conditions first */
     char fields[8][32], ops[8][4], values[8][64];
     for (int i = 0; i < cond_count; i++) {
         if (!parse_condition(conditions[i], fields[i], ops[i], values[i])) {
@@ -449,10 +545,8 @@ static void op_filter(const char *district, int cond_count,
             return;
         }
     }
-
     int fd = open(rp, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "District '%s' not found.\n", district); return; }
-
     Report r;
     int printed = 0;
     while (read(fd, &r, sizeof(r)) == (ssize_t)sizeof(r)) {
@@ -475,10 +569,10 @@ static void op_filter(const char *district, int cond_count,
     }
     close(fd);
     if (printed == 0) printf("No reports matched.\n");
-
     log_action(district, role, user, "filter");
 }
 
+/* Verifica symlink-uri dangling */
 static void check_symlinks(void) {
     DIR *d = opendir(".");
     if (!d) return;
@@ -497,16 +591,15 @@ static void check_symlinks(void) {
 }
 
 int main(int argc, char *argv[]) {
-    char *role     = NULL;
-    char *user     = NULL;
-    char *command  = NULL;
-    char *district = NULL;
+    char *role      = NULL;
+    char *user      = NULL;
+    char *command   = NULL;
+    char *district  = NULL;
     int   report_id = -1;
     int   threshold = -1;
     char *filter_conds[8];
     int   filter_count = 0;
 
-    /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--role") == 0 && i+1 < argc) {
             role = argv[++i];
@@ -524,6 +617,9 @@ int main(int argc, char *argv[]) {
             command = "remove_report";
             district  = argv[++i];
             report_id = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--remove_district") == 0 && i+1 < argc) {
+            command = "remove_district";
+            district = argv[++i];
         } else if (strcmp(argv[i], "--update_threshold") == 0 && i+2 < argc) {
             command = "update_threshold";
             district  = argv[++i];
@@ -531,7 +627,6 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--filter") == 0 && i+1 < argc) {
             command  = "filter";
             district = argv[++i];
-            /* collect remaining args as conditions */
             while (i+1 < argc && argv[i+1][0] != '-' && filter_count < 8) {
                 filter_conds[filter_count++] = argv[++i];
             }
@@ -560,6 +655,8 @@ int main(int argc, char *argv[]) {
         op_view(district, report_id, role, user);
     } else if (strcmp(command, "remove_report") == 0) {
         op_remove_report(district, report_id, role, user, is_manager);
+    } else if (strcmp(command, "remove_district") == 0) {
+        op_remove_district(district, role, user, is_manager);
     } else if (strcmp(command, "update_threshold") == 0) {
         op_update_threshold(district, threshold, role, user, is_manager);
     } else if (strcmp(command, "filter") == 0) {
