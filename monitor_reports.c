@@ -1,8 +1,5 @@
-/* Activam standardul POSIX 2008 - necesar pentru sigaction(), kill(), getpid() etc. */
 #define _POSIX_C_SOURCE 200809L
-/* Activam extensiile X/Open - necesar pentru unele functii de timp */
 #define _XOPEN_SOURCE   700
-
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,106 +14,133 @@
 
 #define PID_FILE ".monitor_pid"
 
-static volatile sig_atomic_t got_sigint  = 0;
-
-static volatile sig_atomic_t got_sigusr1 = 0;
+static volatile sig_atomic_t got_sigint  = 0; /* setat la SIGINT => oprire */
+static volatile sig_atomic_t got_sigusr1 = 0; /* setat la SIGUSR1 => raport nou */
 
 static void handle_sigint(int signo) {
-    /* (void)signo suprima warning-ul "unused parameter" de la compilator */
-    (void)signo;
-    /* Setam flag-ul la 1 ca sa semnalam buclei principale sa se opreasca */
+    (void)signo; /* suprimam warning unused parameter */
     got_sigint = 1;
 }
 
+/* Handler SIGUSR1: seteaza flag-ul de notificare raport nou */
 static void handle_sigusr1(int signo) {
-    /* Suprimam warning-ul pentru parametrul neutilizat */
     (void)signo;
-    /* Semnalam buclei principale ca a venit o notificare de raport nou */
     got_sigusr1 = 1;
+}
+
+static pid_t check_existing_monitor(void) {
+    /* Incercam sa deschidem fisierul PID */
+    int fd = open(PID_FILE, O_RDONLY);
+    if (fd < 0) return -1; /* fisierul nu exista => niciun monitor nu ruleaza */
+
+    /* Citim PID-ul din fisier */
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1; /* fisier gol sau eroare */
+
+    /* Convertim la pid_t */
+    pid_t pid = (pid_t)atoi(buf);
+    if (pid <= 0) return -1;
+
+    /* kill(pid, 0) = verifica daca procesul cu acest PID exista.
+       Returneaza 0 daca procesul exista, -1 daca nu (errno=ESRCH). */
+    if (kill(pid, 0) == 0) {
+        /* Procesul exista => alt monitor ruleaza deja */
+        return pid;
+    }
+    /* Procesul nu mai exista (fisierul PID e stale/vechi) */
+    return -1;
 }
 
 static void write_pid_file(void) {
     int fd = open(PID_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    /* Daca deschiderea a esuat, afisam eroarea si oprim programul */
     if (fd < 0) {
-        perror("Cannot create .monitor_pid");
-        exit(1); 
+        printf("ERROR:cannot create .monitor_pid\n");
+        fflush(stdout);
+        exit(1);
     }
     char buf[32];
     snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
     write(fd, buf, strlen(buf));
     close(fd);
-    printf("[monitor] Started. PID=%d written to %s\n", (int)getpid(), PID_FILE);
-    fflush(stdout);
+
+    printf("INFO:monitor started PID=%d\n", (int)getpid());
+    fflush(stdout); /* flush imediat pentru ca hub_mon sa il primeasca */
 }
 
+/* Sterge fisierul .monitor_pid la oprire */
 static void remove_pid_file(void) {
-    /* unlink() sterge un fisier de pe disk (sterge intrarea din director).
-       Returneaza 0 la succes, -1 la eroare. */
-    if (unlink(PID_FILE) == 0) {
-        /* Fisierul a fost sters cu succes */
-        printf("[monitor] Removed %s\n", PID_FILE);
-    } else {
-        /* unlink() a esuat - probabil fisierul nu mai exista */
-        perror("[monitor] Could not remove .monitor_pid");
-    }
+    unlink(PID_FILE);
+    printf("SHUTDOWN:monitor stopped PID=%d\n", (int)getpid());
+    fflush(stdout);
 }
 
 int main(void) {
-    printf("[monitor] monitor_reports starting...\n");
-    fflush(stdout);
-    write_pid_file();
-    struct sigaction sa_int, sa_usr1;
+    pid_t existing = check_existing_monitor();
+    if (existing > 0) {
+        /* Alt monitor ruleaza deja => trimitem eroare prin stdout (pipe)
+           si iesim imediat fara sa scriem in .monitor_pid */
+        printf("ERROR:monitor already running PID=%d\n", (int)existing);
+        fflush(stdout);
+        /* SHUTDOWN ca sa stie hub_mon ca am terminat */
+        printf("SHUTDOWN:duplicate monitor exiting\n");
+        fflush(stdout);
+        return 1;
+    }
 
+    /* Scriem PID-ul nostru in fisier */
+    write_pid_file();
+
+    /* ── Instalarea handler-elor de semnale cu sigaction() ── */
+    struct sigaction sa_int, sa_usr1;
     memset(&sa_int,  0, sizeof(sa_int));
     memset(&sa_usr1, 0, sizeof(sa_usr1));
 
+    /* Handler pentru SIGINT (oprire) */
     sa_int.sa_handler = handle_sigint;
-
     sigemptyset(&sa_int.sa_mask);
-
     sa_int.sa_flags = 0;
-    
     if (sigaction(SIGINT, &sa_int, NULL) < 0) {
-        perror("sigaction SIGINT");
-        remove_pid_file(); /* curatam inainte sa iesim */
-        exit(1);
-    }
-
-    /* Setam handler-ul pentru SIGUSR1 (acelasi procedeu ca pentru SIGINT) */
-    sa_usr1.sa_handler = handle_sigusr1;
-    sigemptyset(&sa_usr1.sa_mask);
-    sa_usr1.sa_flags = 0;
-    /* Instaleaza handler-ul pentru SIGUSR1 */
-    if (sigaction(SIGUSR1, &sa_usr1, NULL) < 0) {
-        perror("sigaction SIGUSR1");
+        printf("ERROR:sigaction SIGINT failed\n");
+        fflush(stdout);
         remove_pid_file();
         exit(1);
     }
 
-    /* Mesaj de confirmare ca handler-ele sunt instalate */
-    printf("[monitor] Waiting for signals. Send SIGUSR1 to notify, SIGINT to stop.\n");
+    /* Handler pentru SIGUSR1 (notificare raport nou) */
+    sa_usr1.sa_handler = handle_sigusr1;
+    sigemptyset(&sa_usr1.sa_mask);
+    sa_usr1.sa_flags = 0;
+    if (sigaction(SIGUSR1, &sa_usr1, NULL) < 0) {
+        printf("ERROR:sigaction SIGUSR1 failed\n");
+        fflush(stdout);
+        remove_pid_file();
+        exit(1);
+    }
+
+    printf("INFO:monitor ready waiting for signals\n");
     fflush(stdout);
 
+    /* ── Bucla principala ── */
+    /* Asteptam semnale pana primim SIGINT */
     while (!got_sigint) {
+        /* pause() suspenda procesul pana vine un semnal - eficient, fara CPU waste */
         pause();
 
+        /* Verificam SIGUSR1 - raport nou adaugat */
         if (got_sigusr1) {
-            /* Resetam flag-ul imediat la 0 pentru a putea detecta
-               urmatorul semnal SIGUSR1 care va veni */
-            got_sigusr1 = 0;
+            got_sigusr1 = 0; /* resetam flag-ul pentru urmatorul semnal */
 
+            /* Obtinem timestamp-ul curent */
             time_t now = time(NULL);
-        
             char timebuf[32];
-           
             struct tm *t = localtime(&now);
-            
             strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", t);
 
-            printf("[monitor] [%s] New report added! (SIGUSR1 received)\n", timebuf);
-
-            fflush(stdout);
+            printf("NOTIFY:new report added at %s\n", timebuf);
+            fflush(stdout); /* flush imediat - critic pentru citire din pipe */
         }
 
         if (got_sigint) break;
@@ -127,14 +151,11 @@ int main(void) {
     struct tm *t = localtime(&now);
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", t);
 
-    printf("[monitor] [%s] SIGINT received. Shutting down...\n", timebuf);
+    printf("SHUTDOWN:received SIGINT at %s\n", timebuf);
     fflush(stdout);
 
-    /* Stergem fisierul .monitor_pid inainte de iesire */
+    /* Stergem fisierul PID */
     remove_pid_file();
-
-    printf("[monitor] Goodbye.\n");
-    fflush(stdout);
 
     return 0;
 }
